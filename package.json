@@ -1,8 +1,8 @@
 {
   "name": "parentguard-remote-relay",
-  "version": "3.3.0",
+  "version": "3.2.0",
   "private": true,
-  "description": "ParentGuard HTTPS API plus authenticated WSS, persistent state, durable messages, and binary screen streaming",
+  "description": "ParentGuard HTTPS API plus authenticated WSS with persistent state and durable message queue",
   "scripts": {
     "start": "node server.js"
   },

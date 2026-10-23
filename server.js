@@ -1,6 +1,6 @@
 'use strict';
 // ParentGuard relay API. Deploy behind a managed HTTPS reverse proxy (TLS required).
-// In-memory MVP: pairing/session data resets on restart. Add a persistent database before production.
+// Relay state is persisted to DATA_DIR when a persistent disk is configured. Screen frames remain transient.
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
@@ -67,10 +67,10 @@ const server=http.createServer(async(req,res)=>{
   if(req.method==='OPTIONS'){res.writeHead(204);return res.end();}
   try {
     clean(); const u=new URL(req.url,'http://localhost');
-    if(req.method==='GET'&&u.pathname==='/health') return send(res,200,{ok:true,service:'ParentGuard relay',version:'3.2.0',websocket:'/v1/ws'});
+    if(req.method==='GET'&&u.pathname==='/health') return send(res,200,{ok:true,service:'ParentGuard relay',version:'3.3.0',websocket:'/v1/ws'});
     if(req.method==='POST'&&u.pathname==='/v1/pair/start'){
       const b=await read(req); const deviceId=crypto.randomUUID(); const deviceToken=token(); const pairingCode=code();
-      devices.set(deviceId,{id:deviceId,token:deviceToken,created:now(),lastSeen:0,snapshot:{status:'Waiting for first sync'},frame:null,request:null,sharing:false,messages:[],control:null});
+      devices.set(deviceId,{id:deviceId,token:deviceToken,created:now(),lastSeen:0,snapshot:{status:'Waiting for first sync'},frame:null,request:null,sharing:false,messages:[],emergencyAlerts:[],emergencyDelivered:[],control:null});
       persistState();
       pairCodes.set(pairingCode,{deviceId,expires:now()+5*60*1000});
       persistState();
@@ -100,6 +100,26 @@ const server=http.createServer(async(req,res)=>{
     if(req.method==='GET'&&u.pathname==='/v1/control'){
       const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const control=d.control||null; d.control=null; persistState(); return send(res,200,{control});
     }
+    // Parent-to-child urgent emergency alert queue. Alerts remain queued until child ACKs.
+    if(req.method==='POST'&&u.pathname==='/v1/emergency/alert'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      const b=await read(req); const message=String(b.message||'Please check in with your parent now.').trim();
+      if(!message)return send(res,400,{error:'Emergency message cannot be empty'});
+      if(message.length>500)return send(res,413,{error:'Emergency message must be 500 characters or fewer'});
+      const queue=d.emergencyAlerts||(d.emergencyAlerts=[]); if(queue.length>=100)return send(res,429,{error:'Emergency queue is full; clear pending alerts before sending another.'});
+      const item={id:token(),text:message,created:now(),kind:'emergency',status:'queued'}; queue.push(item);
+      persistState(); notifyDevice(d.id,'emergency_alert',item); return send(res,200,{ok:true,alertId:item.id,queued:true,status:'queued'});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/emergency/inbox'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); return send(res,200,{alert:(d.emergencyAlerts||[])[0]||null});
+    }
+    if(req.method==='POST'&&u.pathname==='/v1/emergency/ack'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const b=await read(req); const id=String(b.id||''); const index=(d.emergencyAlerts||[]).findIndex(x=>x.id===id); if(index>=0){const item=d.emergencyAlerts.splice(index,1)[0]; item.status='notification_posted'; item.deliveredAt=now(); d.emergencyDelivered=d.emergencyDelivered||[]; d.emergencyDelivered.push(item); if(d.emergencyDelivered.length>100)d.emergencyDelivered=d.emergencyDelivered.slice(-100); persistState();} return send(res,200,{ok:true,recorded:index>=0});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/emergency/status'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      const latest=(d.emergencyAlerts||[]).slice(-1)[0]||null; const delivered=(d.emergencyDelivered||[]).slice(-1)[0]||null; return send(res,200,{queued:(d.emergencyAlerts||[]).length,latest:latest?{id:latest.id,created:latest.created,text:latest.text,status:latest.status||'queued'}:null,lastDelivered:delivered?{id:delivered.id,created:delivered.created,deliveredAt:delivered.deliveredAt,text:delivered.text,status:delivered.status}:null,online:now()-d.lastSeen<60000,lastSeen:d.lastSeen});
+    }
     if(req.method==='POST'&&u.pathname==='/v1/message'){
       const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
       const b=await read(req); const message=String(b.message||'').trim(); if(!message)return send(res,400,{error:'Message cannot be empty'}); if(message.length>500)return send(res,413,{error:'Message must be 500 characters or fewer'});
@@ -111,6 +131,49 @@ const server=http.createServer(async(req,res)=>{
     }
     if(req.method==='POST'&&u.pathname==='/v1/message/ack'){
       const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const b=await read(req); d.messages=(d.messages||[]).filter(m=>m.id!==String(b.id||'')); persistState(); return send(res,200,{ok:true});
+    }
+    // SMS history is shared only after explicit opt-in and Android SMS permission on the child device.
+    if(req.method==='POST'&&u.pathname==='/v1/sms/sync'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'});
+      const b=await read(req); const incoming=Array.isArray(b.messages)?b.messages:[];
+      if(incoming.length>100)return send(res,413,{error:'Maximum 100 SMS records per batch'});
+      d.smsHistory=d.smsHistory||[]; const known=new Set(d.smsHistory.map(x=>String(x.sourceId)));
+      for(const m of incoming){
+        if(!m||m.sourceId==null)continue;
+        const sourceId=String(m.sourceId); if(!/^\d{1,20}$/.test(sourceId)||known.has(sourceId))continue;
+        const body=String(m.body||''); const address=String(m.address||'Unknown sender');
+        if(body.length>10000||address.length>300)continue;
+        d.smsHistory.push({sourceId,address,body,date:Math.max(0,Number(m.date)||0),direction:['incoming','outgoing'].includes(m.direction)?m.direction:'other',receivedAt:now()}); known.add(sourceId);
+      }
+      d.smsHistory.sort((a,b)=>a.date-b.date); if(d.smsHistory.length>2000)d.smsHistory=d.smsHistory.slice(-2000);
+      d.smsHistoryUpdatedAt=now(); persistState(); return send(res,200,{ok:true,accepted:incoming.length,total:d.smsHistory.length,updatedAt:d.smsHistoryUpdatedAt});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/sms/history'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      const q=String(u.searchParams.get('q')||'').toLowerCase().slice(0,100); const all=d.smsHistory||[];
+      const filtered=q?all.filter(m=>String(m.address||'').toLowerCase().includes(q)||String(m.body||'').toLowerCase().includes(q)):all;
+      return send(res,200,{messages:filtered.slice(-1000).reverse(),total:all.length,updatedAt:d.smsHistoryUpdatedAt||0,enabled:!!d.smsHistory});
+    }
+    // Remote app blocking: each parent token is scoped to its paired child device.
+    if(req.method==='POST'&&u.pathname==='/v1/apps/catalog'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const b=await read(req); const incoming=Array.isArray(b.apps)?b.apps:[]; d.appCatalog=[];
+      for(const a of incoming.slice(0,300)){if(!a)continue;const packageName=String(a.packageName||'');const label=String(a.label||packageName);if(!/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(packageName)||label.length>200)continue;d.appCatalog.push({packageName,label});}
+      d.appCatalogUpdatedAt=now(); d.lastSeen=now(); persistState(); return send(res,200,{ok:true,count:d.appCatalog.length,updatedAt:d.appCatalogUpdatedAt});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/apps/catalog'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      return send(res,200,{apps:d.appCatalog||[],blocked:Object.keys(d.appBlocks||{}).filter(k=>d.appBlocks[k]===true),statuses:d.appBlockStatus||{},updatedAt:d.appCatalogUpdatedAt||0,online:now()-d.lastSeen<60000});
+    }
+    if(req.method==='POST'&&u.pathname==='/v1/apps/block'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'}); const b=await read(req); const pkg=String(b.packageName||''); if(!/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(pkg))return send(res,400,{error:'Invalid package name'});
+      if(!(d.appCatalog||[]).some(a=>a.packageName===pkg))return send(res,400,{error:'App is not present in the latest child app catalog'});
+      d.appBlocks=d.appBlocks||{}; if(b.blocked===true)d.appBlocks[pkg]=true;else delete d.appBlocks[pkg]; d.appBlockCommandAt=now(); d.appBlockStatus=d.appBlockStatus||{}; d.appBlockStatus[pkg]={desired:!!b.blocked,status:'pending',updatedAt:now()}; persistState(); notifyDevice(d.id,'app_blocks_updated',{packageName:pkg,blocked:!!b.blocked}); return send(res,200,{ok:true,status:'Command queued; waiting for child sync'});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/apps/blocks'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); return send(res,200,{blocked:Object.keys(d.appBlocks||{}).filter(k=>d.appBlocks[k]===true),updatedAt:d.appBlockCommandAt||0});
+    }
+    if(req.method==='POST'&&u.pathname==='/v1/apps/blocks/status'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const b=await read(req); const pkg=String(b.packageName||''); if(!/^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$/.test(pkg))return send(res,400,{error:'Invalid package name'}); d.appBlockStatus=d.appBlockStatus||{}; d.appBlockStatus[pkg]={desired:!!b.blocked,status:'synced',updatedAt:now()}; persistState(); return send(res,200,{ok:true});
     }
     if(req.method==='POST'&&u.pathname==='/v1/screen/request'){
       const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
@@ -127,6 +190,12 @@ const server=http.createServer(async(req,res)=>{
       const raw=String(b.jpegBase64||''); if(raw.length>1500000)return send(res,413,{error:'Frame too large'}); if(!/^[A-Za-z0-9+/]*={0,2}$/.test(raw))return send(res,400,{error:'Invalid frame'});
       d.frame={jpegBase64:raw,at:now()}; d.lastSeen=now(); return send(res,200,{ok:true});
     }
+    if(req.method==='GET'&&u.pathname==='/v1/screen/status'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      const pending=!!(d.request&&d.request.expires>now());
+      const state=d.sharing?'sharing':(pending?'awaiting_child_approval':'not_active');
+      return send(res,200,{state,online:now()-d.lastSeen<60000,requestExpires:d.request?d.request.expires:0,frameAt:d.frame?d.frame.at:0});
+    }
     if(req.method==='GET'&&u.pathname==='/v1/screen/frame'){
       const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'}); return send(res,200,{sharing:d.sharing,frame:d.frame});
     }
@@ -134,7 +203,7 @@ const server=http.createServer(async(req,res)=>{
   } catch(e) { return send(res,400,{error:'Bad request'}); }
 });
 // WSS runs on the same HTTPS origin/port. The hosting platform terminates TLS.
-const wss = new WebSocket.Server({ noServer: true, maxPayload: 1500 * 1024 });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: 64 * 1024 });
 const sockets = new Map(); // deviceId -> { parent:Set, child:ws }
 // Keep idle sockets from silently hanging behind mobile networks and hosting proxies.
 const heartbeat = setInterval(() => {
@@ -161,21 +230,7 @@ wss.on('connection',(ws)=>{
   ws.on('pong',()=>{ ws._pgAlive = true; });
   let authenticated=false, role='', deviceId='';
   const authTimer=setTimeout(()=>{if(!authenticated)ws.close(1008,'authentication required');},8000);
-  ws.on('message',(raw,isBinary)=>{
-    // V18: authenticated child sends JPEG frames as binary WebSocket messages.
-    // Only relay while the child has an explicitly approved HTTPS screen session.
-    if (isBinary) {
-      if (!authenticated || role !== 'child') { ws.close(1008,'binary frames require child role'); return; }
-      const d = devices.get(deviceId);
-      if (!d || !d.sharing) return;
-      if (!Buffer.isBuffer(raw) || raw.length < 4 || raw.length > 1200 * 1024) return;
-      d.lastSeen = now();
-      const group = sockets.get(deviceId);
-      if (group && group.parent) for (const parentWs of group.parent) {
-        if (parentWs.readyState === WebSocket.OPEN && parentWs._pg && parentWs._pg.role === 'parent') parentWs.send(raw, { binary: true });
-      }
-      return;
-    }
+  ws.on('message',(raw)=>{
     let msg; try{msg=JSON.parse(String(raw));}catch(e){ws.close(1007,'invalid JSON');return;}
     if(!authenticated){
       if(msg.type!=='auth'||!msg.token||!['parent','child'].includes(msg.role)){ws.close(1008,'invalid authentication');return;}
@@ -198,5 +253,5 @@ wss.on('connection',(ws)=>{
 });
 // Publish events after the existing HTTPS route has validated its bearer token and payload.
 const originalSend=send;
-server.listen(PORT,'0.0.0.0',()=>console.log('ParentGuard relay v3.3.0 listening on '+PORT+'; HTTPS API + authenticated WSS /v1/ws with binary screen frames'));
+server.listen(PORT,'0.0.0.0',()=>console.log('ParentGuard relay v3.2.0 listening on '+PORT+'; HTTPS API + authenticated WSS /v1/ws'));
 process.on('SIGTERM',()=>{ clearInterval(heartbeat); if(persistTimer){clearTimeout(persistTimer);persistTimer=null;} try { fs.mkdirSync(DATA_DIR,{recursive:true}); const state={savedAt:now(),devices:Array.from(devices.values()).map(d=>({...d,frame:null})),pairCodes:Array.from(pairCodes.entries()),parentTokens:Array.from(parentTokens.entries())}; const temp=DATA_FILE+'.tmp'; fs.writeFileSync(temp,JSON.stringify(state),{mode:0o600}); fs.renameSync(temp,DATA_FILE); } catch(e){console.error('Final state save failed:',e.message);}  for(const ws of wss.clients) ws.close(1001,'server shutting down'); server.close(()=>process.exit(0)); setTimeout(()=>process.exit(0),5000).unref(); });
