@@ -154,6 +154,29 @@ const server=http.createServer(async(req,res)=>{
       const filtered=q?all.filter(m=>String(m.address||'').toLowerCase().includes(q)||String(m.body||'').toLowerCase().includes(q)):all;
       return send(res,200,{messages:filtered.slice(-1000).reverse(),total:all.length,updatedAt:d.smsHistoryUpdatedAt||0,enabled:!!d.smsHistory});
     }
+    // Call history is only accepted after opt-in and Android READ_CALL_LOG permission on the child.
+    if(req.method==='POST'&&u.pathname==='/v1/calls/sync'){
+      const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'});
+      const b=await read(req); const incoming=Array.isArray(b.calls)?b.calls:[];
+      if(incoming.length>100)return send(res,413,{error:'Maximum 100 call records per batch'});
+      d.callHistory=d.callHistory||[]; const known=new Set(d.callHistory.map(x=>String(x.sourceId)));
+      for(const c of incoming){
+        if(!c||c.sourceId==null)continue; const sourceId=String(c.sourceId);
+        if(!/^\d{1,20}$/.test(sourceId)||known.has(sourceId))continue;
+        const number=String(c.number||'Unknown number'),name=String(c.name||'');
+        if(number.length>300||name.length>300)continue;
+        const type=['incoming','outgoing','missed','rejected','blocked'].includes(c.type)?c.type:'other';
+        d.callHistory.push({sourceId,number,name,type,date:Math.max(0,Number(c.date)||0),duration:Math.max(0,Number(c.duration)||0),receivedAt:now()}); known.add(sourceId);
+      }
+      d.callHistory.sort((a,b)=>a.date-b.date); if(d.callHistory.length>2000)d.callHistory=d.callHistory.slice(-2000);
+      d.callHistoryUpdatedAt=now(); persistState(); return send(res,200,{ok:true,accepted:incoming.length,total:d.callHistory.length,updatedAt:d.callHistoryUpdatedAt});
+    }
+    if(req.method==='GET'&&u.pathname==='/v1/calls/history'){
+      const p=getParent(req); if(!p)return send(res,401,{error:'Invalid parent token'}); const d=devices.get(p.deviceId); if(!d)return send(res,404,{error:'Device not found'});
+      const q=String(u.searchParams.get('q')||'').toLowerCase().slice(0,100); const all=d.callHistory||[];
+      const filtered=q?all.filter(c=>String(c.number||'').toLowerCase().includes(q)||String(c.name||'').toLowerCase().includes(q)||String(c.type||'').toLowerCase().includes(q)):all;
+      return send(res,200,{calls:filtered.slice(-1000).reverse(),total:all.length,updatedAt:d.callHistoryUpdatedAt||0,enabled:!!d.callHistory});
+    }
     // Remote app blocking: each parent token is scoped to its paired child device.
     if(req.method==='POST'&&u.pathname==='/v1/apps/catalog'){
       const d=getDevice(req); if(!d)return send(res,401,{error:'Invalid device token'}); const b=await read(req); const incoming=Array.isArray(b.apps)?b.apps:[]; d.appCatalog=[];
